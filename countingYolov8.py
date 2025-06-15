@@ -1,130 +1,160 @@
 import cv2
-import pandas as pd
 import numpy as np
+import pandas as pd
 from ultralytics import YOLO
-from tracker import*
+from tracker import Tracker
 import cvzone
+import datetime
+import threading
+from queue import Queue
+from pymongo import MongoClient
 
-url = "#########################################/video"
+# Load YOLO model and initialize tracker
+model = YOLO('yolov8s.pt')
+tracker = Tracker()
 
-model=YOLO('yolov8s.pt')
+# Camera setup
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
-def RGB(event, x, y, flags, param):
-    if(event==cv2.EVENT_MOUSEMOVE):
-        point = [x,y]
-        print(point)
+# Portrait window size
+window_width, window_height = 720, 1280
+output = cv2.VideoWriter('output_final.avi', cv2.VideoWriter_fourcc(*'MPEG'), 30, (window_width, window_height))
 
-cv2.namedWindow('RGB')
-cv2.setMouseCallback('RGB', RGB)
-cap=cv2.VideoCapture('3.mp4')
+# Counters and storage
+offset = 6
+count = 0
+persondown = {}
+personup = {}
+counter_down = []
+counter_up = []
 
-# fourcc = cv2.VideoWriter_fourcc(*'avc1')
-# out = cv2.VideoWriter('output.avi',fourcc, 5, (640,480))
+# MongoDB setup
+client = MongoClient("mongodb+srv://seanbartolome7slm:cap2419it@busmateph.vfi4r.mongodb.net/?tlsAllowInvalidCertificates=true")
+db = client["BusMatePH"]
+collection = db["capacity"]
+data_queue = Queue()
 
-output = cv2.VideoWriter('output_final.avi',cv2.VideoWriter_fourcc(*'MPEG'),30,(1020,500))
+# Logging thread function
+def log_data_worker():
+    while True:
+        try:
+            capacity = data_queue.get()
+            query = {"busID": 4}
+            update = {
+                "$set": {
+                    "capacity": capacity,
+                    "date": datetime.datetime.now()
+                }
+            }
+            collection.update_one(query, update, upsert=True)
+            print(f"[LOGGED] Bus Capacity = {capacity}")
+        except Exception as e:
+            print("[MongoDB ERROR]:", e)
+        finally:
+            data_queue.task_done()
 
-file = open('coco.names', 'r')
-data = file.read()
-class_list = data.split('\n')
-
-count=0
-persondown={}
-tracker=Tracker()
-counter1=[]
-
-personup={}
-counter2=[]
-cy1=194
-cy2=220
-offset=6
+# Start logging thread
+threading.Thread(target=log_data_worker, daemon=True).start()
 
 while True:
     ret, frame = cap.read()
     if not ret:
+        print("Failed to grab frame")
         break
-    #frame=stream_read()
 
-    count+=1
-    if (count%3 != 0):
+    count += 1
+    if count % 3 != 0:
         continue
 
-    frame=cv2.resize(frame, (1020,500))
+    cam_height, cam_width = frame.shape[:2]
+    scale = window_width / cam_width
+    new_w = window_width
+    new_h = int(cam_height * scale)
+    resized_frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
 
-    results=model.predict(frame)
-    #print(results)
+    canvas = np.zeros((window_height, window_width, 3), dtype=np.uint8)
+    y_offset = (window_height - new_h) // 2
+    canvas[y_offset:y_offset+new_h, 0:new_w] = resized_frame
 
-    a=results[0].boxes.data
-    px=pd.DataFrame(a).astype("float")
-    #print(px)
+    cy1 = int(new_h * 0.48) + y_offset
+    cy2 = int(new_h * 0.52) + y_offset
 
-    list=[]
+    results = model.predict(resized_frame)
+    boxes = results[0].boxes.data.cpu().numpy()
+    px = pd.DataFrame(boxes).astype(float)
 
-    for index,row in px.iterrows():
-        #print(rows)
+    detected_boxes = []
+    for idx, row in px.iterrows():
+        x1, y1, x2, y2, score, cls = row[:6]
+        class_id = int(cls)
+        class_name = model.names[class_id] if hasattr(model, 'names') else 'person'
+        if 'person' in class_name:
+            detected_boxes.append([int(x1), int(y1), int(x2), int(y2)])
 
-        x1=int(row[0])
-        y1=int(row[1])
-        x2=int(row[2])
-        y2=int(row[3])
-        d=int(row[5])
+    bbox_id = tracker.update(detected_boxes)
 
-        c=class_list[d]
-        if 'person' in c:
-            list.append([x1,y1,x2,y2])
-    
-    bbox_id=tracker.update(list)
     for bbox in bbox_id:
-        x3,y3,x4,y4,id=bbox
-        cx=int(x3+x4)//2
-        cy=int(y3+y4)//2
-        cv2.circle(frame,(cx,cy),4,(255,0,255),-1)
+        x3, y3, x4, y4, id = bbox
+        cx = (x3 + x4) // 2
+        cy = (y3 + y4) // 2
 
-        ## for down going
-        if (cy1<(cy+offset) and (cy1>cy-offset)):
+        cx_c = cx
+        cy_c = cy + y_offset
+        x3_c = x3
+        y3_c = y3 + y_offset
+        x4_c = x4
+        y4_c = y4 + y_offset
 
-            cv2.rectangle(frame, (x3,y3),(x4,y4),(0,0,255),2)
-            cvzone.putTextRect(frame,f'{id}', (x3,y3), 1,2)
-            persondown[id]=(cx,cy)
+        cv2.circle(canvas, (cx_c, cy_c), 4, (255, 0, 255), -1)
 
-        if (id in persondown):
-            if (cy2<(cy+offset) and (cy2>cy-offset)):
-                cv2.rectangle(frame, (x3,y3),(x4,y4),(0,255,255),2)
-                cvzone.putTextRect(frame,f'{id}', (x3,y3), 1,2)
-                if counter1.count(id)==0:
-                    counter1.append(id)
-        
-        ## for up going
-        if (cy2<(cy+offset) and (cy2>cy-offset)):
+        if cy1 - offset < cy_c < cy1 + offset:
+            cv2.rectangle(canvas, (x3_c, y3_c), (x4_c, y4_c), (0, 0, 255), 2)
+            cvzone.putTextRect(canvas, f'{id}', (x3_c, y3_c), 1, 2)
+            persondown[id] = (cx_c, cy_c)
 
-            cv2.rectangle(frame, (x3,y3),(x4,y4),(0,255,0),2)
-            cvzone.putTextRect(frame,f'{id}', (x3,y3), 1,2)
-            personup[id]=(cx,cy)
+        if id in persondown:
+            if cy2 - offset < cy_c < cy2 + offset:
+                cv2.rectangle(canvas, (x3_c, y3_c), (x4_c, y4_c), (0, 255, 255), 2)
+                cvzone.putTextRect(canvas, f'{id}', (x3_c, y3_c), 1, 2)
+                if id not in counter_down:
+                    counter_down.append(id)
 
-        if (id in personup):
-            if (cy1<(cy+offset) and (cy1>cy-offset)):
-                cv2.rectangle(frame, (x3,y3),(x4,y4),(0,255,255),2)
-                cvzone.putTextRect(frame,f'{id}', (x3,y3), 1,2)
-                if counter2.count(id)==0:
-                    counter2.append(id)
+        if cy2 - offset < cy_c < cy2 + offset:
+            cv2.rectangle(canvas, (x3_c, y3_c), (x4_c, y4_c), (0, 255, 0), 2)
+            cvzone.putTextRect(canvas, f'{id}', (x3_c, y3_c), 1, 2)
+            personup[id] = (cx_c, cy_c)
 
-    cv2.line(frame,(3,cy1), (1018,cy1),(0,255,0),2)
-    cv2.line(frame,(5,cy2), (1019,cy2),(0,255,255),2)
+        if id in personup:
+            if cy1 - offset < cy_c < cy1 + offset:
+                cv2.rectangle(canvas, (x3_c, y3_c), (x4_c, y4_c), (0, 255, 255), 2)
+                cvzone.putTextRect(canvas, f'{id}', (x3_c, y3_c), 1, 2)
+                if id not in counter_up:
+                    counter_up.append(id)
 
-    #print(persondown)
-    #print(counter1)
-    #print(len(counter1)) #lenght means we can get the counnt who is going down
-    downcount=len(counter1)
-    upcount=len(counter2)
-    
-    cvzone.putTextRect(frame, f'Down: {downcount}', (50,60), 2,2)
-    cvzone.putTextRect(frame, f'Up: {upcount}', (50,160), 2,2)
-    output.write(frame)
-    cv2.imshow('RGB', frame)
-    if cv2.waitKey(1) & 0xff==27:
+    # Draw lines
+    cv2.line(canvas, (0, cy1), (window_width, cy1), (0, 255, 0), 2)
+    cv2.line(canvas, (0, cy2), (window_width, cy2), (0, 255, 255), 2)
+
+    downcount = len(counter_down)
+    upcount = len(counter_up)
+    current_capacity = upcount - downcount
+
+    # Log capacity (only when changed)
+    if not hasattr(log_data_worker, "last_logged") or current_capacity != log_data_worker.last_logged:
+        data_queue.put(current_capacity)
+        log_data_worker.last_logged = current_capacity
+
+    cvzone.putTextRect(canvas, f'Up: {downcount}', (50, 60), 2, 2)
+    cvzone.putTextRect(canvas, f'Down: {upcount}', (50, 160), 2, 2)
+
+    output.write(canvas)
+    cv2.imshow('RGB', canvas)
+
+    if cv2.waitKey(1) & 0xFF == 27:
         break
 
 cap.release()
+output.release()
 cv2.destroyAllWindows()
-
-
-
